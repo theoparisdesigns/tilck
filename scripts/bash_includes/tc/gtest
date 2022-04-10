@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+##############################
+# Build gtest
+##############################
+
+GTEST_VER="1.11.0"
+GTEST_DIRNAME="gtest-$GTEST_VER"
+GTEST_SRC_DIR="$TC/noarch/$GTEST_DIRNAME"
+
+function download_googletest {
+
+   local tarname="$GTEST_DIRNAME.tgz"
+   local url="https://github.com/google/googletest.git"
+
+   if ! [ -d $GTEST_SRC_DIR ]; then
+
+      download_git_repo_in_cache "$url" release-$GTEST_VER $tarname googletest
+
+      pushd $TC/noarch
+      extract_cachefile_tar_gz $tarname "googletest" $GTEST_DIRNAME
+      popd
+
+      if [ -d $TC/cache/googletest ]; then
+         # Delete the old locations of googletest
+         rm -rf $TC/cache/googletest
+         rm -rf $TC/host_i386/gtest
+         rm -rf $TC/host_x86_64/gtest
+      fi
+
+      if ! [ -L $TC/cache/googletest ]; then
+         # Create a symlink to allow older commits being able to build
+         pushd $TC/cache
+         ln -s $GTEST_SRC_DIR googletest
+         popd
+      fi
+
+      # Fix for GCC 11.x
+      pushd $TC/noarch/$GTEST_DIRNAME
+      sed -i '1222s/int dummy/int dummy=0/g' googletest/src/gtest-death-test.cc
+      popd
+   fi
+}
+
+function gtest_make_compact_symlinks {
+
+   if [ -d $TC/host_$1/googletest ]; then
+      rm -rf $TC/host_$1/gtest
+   fi
+
+   if ! [ -L $TC/host_$1/googletest ]; then
+      pushd $TC/host_$1
+      ln -s $GTEST_DIRNAME gtest
+      popd
+   fi
+}
+
+all_funcs_list+=(build_gtest)
+function build_gtest {
+
+   download_googletest
+   pushd host_$HOST_ARCH
+
+   if ! [ -d $GTEST_DIRNAME ]; then
+
+      show_work_on_component_msg "GOOGLE TEST ($HOST_ARCH)"
+      mkdir $GTEST_DIRNAME
+      cd $GTEST_DIRNAME
+
+      reset_cc_vars
+
+      $CMAKE                              \
+         -DCMAKE_BUILD_TYPE=Debug         \
+         -DGOOGLETEST_VERSION=$GTEST_VER  \
+         $GTEST_SRC_DIR/googletest
+
+      run_command2 "make -j$BUILD_PAR" build.log
+      gtest_make_compact_symlinks $HOST_ARCH
+
+   else
+      show_skip_component_msg "GOOGLE TEST ($HOST_ARCH)"
+   fi
+
+   popd
+}
+
+all_funcs_list+=(build_gtest_arch)
+function build_gtest_arch {
+
+   download_googletest
+   pushd host_$ARCH
+
+   if ! [ -d $GTEST_DIRNAME ]; then
+
+      show_work_on_component_msg "GOOGLE TEST ($ARCH)"
+      download_gcc_glibc_toolchain
+
+      # We have to save the current path and prepend the GLIBC toolchain
+      # to it, because we're targeting the host system.
+
+      local saved_path="$PATH"
+      export PATH="$GCC_TOOLCHAIN_GLIBC:$PATH"
+
+      mkdir $GTEST_DIRNAME
+      cd $GTEST_DIRNAME
+
+      # After this, we'll use the $GCC_TOOLCHAIN_GLIBC toolchain, which is
+      # a cross-toolchain, but uses glibc.
+      set_cc_vars_to_tc
+
+      $CMAKE                              \
+         -DCMAKE_BUILD_TYPE=Debug         \
+         -DGOOGLETEST_VERSION=$GTEST_VER  \
+         $GTEST_SRC_DIR/googletest
+
+      run_command2 "make -j" build.log
+      gtest_make_compact_symlinks $ARCH
+
+      # Restore the PATH so that other functions will end up calling the musl
+      # toolchain with $ARCH-linux-gcc.
+      export PATH="$saved_path"
+
+   else
+      show_skip_component_msg "GOOGLE TEST ($ARCH)"
+   fi
+
+   popd
+}

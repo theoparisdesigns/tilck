@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# GLOBAL VARIABLES
+
+# Reset any forced env-based CFLAGS
+export CFLAGS=""
+export FFLAGS=""
+export CXXFLAGS=""
+export CFFLAGS=""
+
+# Default GCC toolchain version to use
+DEFAULT_GCC_TC_VERSION="8.4.0"
+
+# Project's root directory
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAIN_DIR="$(cd $SOURCE_DIR/.. && pwd)"
+
+# Global toolchain directory
+
+if [ -z "$TCROOT_PARENT" ]; then
+   TCROOT_PARENT="$MAIN_DIR"
+fi
+
+if [ -z "$TCROOT" ]; then
+   TCROOT="$TCROOT_PARENT/toolchain2"
+fi
+
+TC="$TCROOT"
+
+# Constants
+BUILD_ARCH="x86_64" # the only arch accepted for the build machine
+
+# Arch-variables
+
+HOST_ARCH="`uname -m`"
+
+if [[ "$HOST_ARCH" == "x86_64" ]]; then
+
+   : # Great, that's what we expect: do nothing
+
+elif [[ "$HOST_ARCH" == "amd64" ]]; then
+
+   # An alias for x86_64: fix our variable
+   HOST_ARCH="x86_64"
+
+elif [[ "$HOST_ARCH" == "i686" ]]; then
+
+   # Special case, not "officially" supported.
+   # We need to set HOST_ARCH to "i386", to match the convention
+   # used by ARCH and ld.
+
+   HOST_ARCH="i386"
+fi
+
+# ARCH and ARCH_* variables are all about the TARGET architecture
+
+if [[ "$ARCH" == "" ]]; then
+   export ARCH="i386" # default target arch
+fi
+
+if [[ "$ARCH" == "i386" ]]; then
+
+   ARCH_SHORT="x86"
+   ARCH_FAMILY="generic_x86"
+   ARCH_ELF_NAME="elf32-i386"
+   ARCH_LD_OUTPUT="elf_i386"
+   ARCH_EFI="ia32"
+   ARCH_GCC_TC="i686"
+   ARCH_GCC_FLAGS="-m32 -march=$ARCH_GCC_TC"
+   ARCH_GCC_TC_CODENAME="x86-i686"
+
+else
+   echo "Architecture '$ARCH' not supported."
+   exit 1
+fi
+
+# GCC toolchain configuration
+
+if [ -z "$GCC_TC_VER" ]; then
+   if [ -f $TC/.gcc_tc_ver ]; then
+      GCC_TC_VER=$(cat $TC/.gcc_tc_ver)
+   else
+      GCC_TC_VER="$DEFAULT_GCC_TC_VERSION"
+   fi
+fi
+
+if [ -z "$ARCH_GCC_TC_VER" ]; then
+
+   if [ "$GCC_TC_VER" = "6.4.0" ]; then
+
+      ARCH_GCC_TC_VER="stable-2018.02-2"
+
+   elif [ "$GCC_TC_VER" = "7.3.0" ]; then
+
+      ARCH_GCC_TC_VER="stable-2018.11-1"
+
+   elif [ "$GCC_TC_VER" = "8.4.0" ]; then
+
+      ARCH_GCC_TC_VER="stable-2020.02-2"
+
+   elif [ "$GCC_TC_VER" = "9.3.0" ]; then
+
+      ARCH_GCC_TC_VER="stable-2020.08-1"
+
+   else
+      echo "ERROR: unknown value of ARCH_GCC_TC_VER for GCC $GCC_TC_VER"
+      exit 1
+   fi
+fi
+
+if ! [ -f $TC/.gcc_tc_ver ]; then
+
+   mkdir -p $TC
+   echo -n $GCC_TC_VER > $TC/.gcc_tc_ver
+
+else
+
+   saved=$(cat $TC/.gcc_tc_ver)
+   v=$GCC_TC_VER
+
+   if ! [ "$GCC_TC_VER" = "$saved" ]; then
+      echo "WARNING: GCC_TC_VER ($v) does not match with saved one ($saved)"
+      echo "WARNING: This is NOT a supported scenario. Please delete:"
+      echo "   $TC/$ARCH"
+      echo "   $TC/.gcc_tc_ver"
+      echo "And run this script again to use the new toolchain."
+      exit 1
+   fi
+fi
+
+
+
+GCC_TC_VER_=$(echo $GCC_TC_VER | sed -E 's/[.]/_/g')
+GCC_NAME_PFX="gcc_${GCC_TC_VER_}_${ARCH}"
+MUSL_INSTALL=$TC/$ARCH/musl/install
+
+echo
+echo "ARCH=$ARCH"
+echo "HOST_ARCH=$HOST_ARCH"
+echo "GCC_TC_VER=$GCC_TC_VER"
+echo "ARCH_GCC_TC_VER=$ARCH_GCC_TC_VER"
+echo
+
+function save_cc_vars {
+
+   if [[ "$HOST_ARCH" != "$BUILD_ARCH" ]]; then
+
+      # HOST_ARCH == ARCH case
+
+      if [ -z "$AR" ]; then
+         export AR="ar"
+      fi
+
+      if [ -z "$NM" ]; then
+         export NM="nm"
+      fi
+
+      if [ -z "$RANLIB" ]; then
+         export RANLIB="ranlib"
+      fi
+   fi
+
+   saved_CC=$CC
+   saved_CXX=$CXX
+   saved_AR=$AR
+   saved_NM=$NM
+   saved_RANLIB=$RANLIB
+}
+
+function set_cc_vars_to_tc {
+
+   if [[ "$HOST_ARCH" == "$BUILD_ARCH" ]]; then
+
+      # Default case: use our cross toolchain
+
+      export CC="${ARCH_GCC_TC}-linux-gcc"
+      export CXX="${ARCH_GCC_TC}-linux-g++"
+      export AR="${ARCH_GCC_TC}-linux-ar"
+      export NM="${ARCH_GCC_TC}-linux-nm"
+      export RANLIB="${ARCH_GCC_TC}-linux-ranlib"
+
+   fi
+}
+
+function reset_cc_vars_to_null {
+
+   export CC=""
+   export CXX=""
+   export AR=""
+   export NM=""
+   export RANLIB=""
+}
+
+
+function reset_cc_vars {
+
+   export CC=$saved_CC
+   export CXX=$saved_CXX
+   export AR=$saved_AR
+   export NM=$saved_NM
+   export RANLIB=$saved_RANLIB
+}
+
+all_funcs_list=()
+
+# Source files to include
+source $MAIN_DIR/scripts/bash_includes/script_utils
+
+function arch_checks {
+
+   if [[ "$HOST_ARCH" != *"$BUILD_ARCH"* ]]; then
+
+      echo "WARNING: Tilck is designed to be built only on $BUILD_ARCH host "
+      echo "machines no matter which target architecture has been chosen. "
+      echo "Reason: the build system uses a toolchain pre-compiled for "
+      echo "$BUILD_ARCH hosts."
+      echo
+      echo "Detected HOST_ARCH (uname -m): $HOST_ARCH"
+      echo
+      echo "The only (unofficially supported) scenario allowing "
+      echo "HOST_ARCH != $BUILD_ARCH is to have HOST_ARCH == ARCH and the env "
+      echo "variables USE_SYSCC, CC, CXX set correctly."
+      echo
+
+      if [[ "$HOST_ARCH" == "$ARCH" ]]; then
+
+         if [[ "$USE_SYSCC" != "" && "$USE_SYSCC" != 0 ]]; then
+
+            echo "In this case, HOST_ARCH == ARCH and USE_SYSCC is set."
+            echo "The script can continue, but WARNING: this scenario is not "
+            echo "tested as often as the main one (building on $BUILD_ARCH)."
+            echo ""
+            echo -n "Proceed [Y/n] ? "
+
+            read ans
+
+            if [[ "$ans" == "" || "$ans" == "y" || "$ans" == "Y" ]]; then
+               echo "OK."
+            else
+               echo "Aborted."
+               exit 1
+            fi
+
+         else
+
+            echo "In this case USE_SYSCC, CC and CXX are NOT set."
+            echo "Unable to continue."
+            exit 1
+         fi
+
+      else
+
+         echo "In this case, HOST_ARCH ($HOST_ARCH) != ARCH ($ARCH)"
+         echo "Unable to continue."
+         exit 1
+      fi
+   fi
+}
+
+function compiler_checks {
+
+   if [[ "$USE_SYSCC" != "" && "$USE_SYSCC" != 0 ]]; then
+
+      if [[ "$CC" == "" || "$CXX" == "" ]]; then
+
+         echo "WARNING: CC and CXX should both be set when USE_SYSCC=1."
+         echo -n "Do you want just to use gcc and g++? [Y/n] "
+         read ans
+
+         if [[ "$ans" == "" || "$ans" == "y" || "$ans" == "Y" ]]; then
+
+            echo "----------------------------------------------------------"
+            echo "Setting:"
+            echo "   CC=gcc"
+            echo "   CXX=g++"
+            echo ""
+            export CC="gcc"
+            export CXX="g++"
+
+         else
+
+            echo "Aborted."
+            exit 1
+         fi
+      fi
+
+      local cc_compiler="`$CC --version | cut -d ' ' -f 1 | head -1`"
+      local cxx_compiler="`$CXX --version | cut -d ' ' -f 1 | head -1`"
+
+      if [ -z "$cc_compiler" ]; then
+         echo "ERROR: $CC compiler NOT FOUND"
+         exit 1
+      fi
+
+      if [ -z "$cxx_compiler" ]; then
+         echo "ERROR: $CXX compiler NOT FOUND"
+         exit 1
+      fi
+
+      if [ "$cc_compiler" != "gcc" ]; then
+         echo "ERROR: USE_SYSCC=1 is NOT supported with compilers != GCC."
+         exit 1
+      fi
+
+   fi
+}
+
+function show_help {
+
+   echo ""
+   echo "Syntax:"
+   echo "      $0 [-n]                             run default functions"
+   echo "      $0 -s func1 [func2 [func3 [...]]]   run specific functions"
+   echo ""
+   echo "   -n    Do not check nor install system packages (advanced)"
+   echo "           Even if many packages are downloaded & built by this script"
+   echo "           without touching the system, some packages are required to"
+   echo "           be installed in the system. For example: wget, git, make,"
+   echo "           binutils, bzip2, rpmextract and others similar. When -n"
+   echo "           is NOT passed, the script first tries to detect the current"
+   echo "           Linux distribution and then it checks if all the required"
+   echo "           packages are already installed. In case some packages need"
+   echo "           to be installed, this script will show a list and run:"
+   echo "               sudo <package manager> install [pkg1 [pkg2 [pkg3 ...]]]"
+   echo "           In case the user does not want this script to install the "
+   echo "           necessary packages he/she could just interrupt this script"
+   echo "           with Ctrl+C, without affecting the system."
+   echo ""
+   echo "Functions supported by this script (with -s):"
+   echo ""
+
+   for x in ${default_funcs[@]}; do
+      echo "   - $x (*)"
+   done
+
+   for x in ${all_funcs_list[@]}; do
+      for y in ${default_funcs[@]}; do
+         if [ "$x" == "$y" ]; then
+            continue 2
+         fi
+      done
+      echo "   - $x"
+   done
+
+   echo ""
+   echo -e "(*) Default functions\n"
+}
+
+function show_error_no_func {
+   echo "ERROR: The function '$1' does not exist. Re-run with --help."
+}
+
+function execute_func {
+
+   if [ -n "$(type -t $1)" ] && [ "$(type -t $1)" = function ]; then
+
+      echo "[build_toolchain] Executing single function '$1'"
+      $1
+      echo "[build_toolchain] Executing single function: DONE"
+
+      return 0
+
+   else
+
+      return 1  # No such function
+   fi
+}
+
+function check_func {
+
+   local func="$1"
+
+   for x in ${all_funcs_list[@]}; do
+      if [[ "$x" == "$func" ||
+            "$x" == "build_$func" ||
+            "$x" == "download_$func" ]]
+      then
+         return 0
+      fi
+   done
+
+   return 1 # Function not found
+}
+
+##########################################################
+#
+# MAIN
+#
+##########################################################
+
+function main {
+
+   default_funcs=()
+
+   if [[ "$HOST_ARCH" == "$BUILD_ARCH" ]]; then
+      default_funcs+=(download_gcc_toolchain)   # note: this is the default case
+   else
+      # We don't have our pre-build gcc-musl toolchains for HOST_ARCH, therefore
+      # we *must* build also libmusl, in order to link with musl programs
+      # compiled with the system compiler.
+      default_funcs+=(build_libmusl)
+   fi
+
+   default_funcs+=(download_cmake)
+   default_funcs+=(build_gnuefi)
+   default_funcs+=(build_mtools)
+   default_funcs+=(build_zlib)
+
+   if [ -z "$NO_BUSYBOX" ]; then
+      default_funcs+=(build_busybox)
+   fi
+
+   if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+      show_help
+      exit 0
+   fi
+
+   # Compiler-related checks
+   compiler_checks
+   # Arch-related checks
+   arch_checks
+   # Save the current values of CC, CXX and related
+   save_cc_vars
+
+   # Exit on the first failure
+   set -e
+
+   export PATH="$MAIN_DIR/scripts/build_scripts:$PATH"
+
+   if [[ "$HOST_ARCH" == "$BUILD_ARCH" ]]; then
+
+      local ha=$TC/host_${HOST_ARCH}
+      GCC_TOOLCHAIN=$ha/${GCC_NAME_PFX}_musl/bin # Default cross-compiler
+      GCC_TOOLCHAIN_GLIBC=$ha/${GCC_NAME_PFX}_glibc/bin # NOTE: not in $PATH!
+      unset ha
+
+      # NOTE: GCC's musl pre-built toolchain overrides build_scripts/* in PATH.
+      # This means that, when HOST_ARCH == BUILD_ARCH, i686-linux-gcc will use
+      # its version and NOT the wrapper script in build_scripts which simulates
+      # its behavior using -m32 and -specs.
+      export PATH="$GCC_TOOLCHAIN:$PATH"
+   fi
+
+
+   if [ "$1" == "-s" ] && ! [ -d $TC/$ARCH ]; then
+
+      echo
+      echo "ERROR: directory $TC/$ARCH not found."
+      echo
+      echo "It is necessary to run this script *without* options first to "
+      echo "download and build a minimum toolchain. Then, it will be possible"
+      echo "to download and build the extra packages."
+      echo
+      echo "For more info: "
+      echo "   https://github.com/vvaltchev/tilck/blob/master/docs/building.md"
+
+      exit 1
+   fi
+
+   mkdir -p $TC
+   mkdir -p $TC/cache
+   mkdir -p $TC/noarch
+   mkdir -p $TC/i386
+   mkdir -p $TC/x86_64
+   mkdir -p $TC/host_i386
+   mkdir -p $TC/host_x86_64
+
+   cd $TC
+
+   if ! [ -L host ]; then
+      ln -s host_${HOST_ARCH} host
+   fi
+
+   # Set the CMAKE variable in order to single functions to be able to use it
+   if [ -f $TC/host_$HOST_ARCH/cmake/bin/cmake ]; then
+      CMAKE=$TC/host_$HOST_ARCH/cmake/bin/cmake
+   else
+      CMAKE=cmake
+   fi
+
+
+   if [ "$1" == "-s" ]; then
+
+      if [ $# -lt 2 ]; then
+         echo "Expected the name of the function to call after the $1 option"
+      fi
+
+      shift  # Drop the first argument, $1
+
+      for func in "$@"; do
+
+         if ! check_func "$func"; then
+            show_error_no_func "$func"
+            exit 1
+         fi
+
+         if ! execute_func $func; then
+            if ! execute_func "build_$func"; then
+               if ! execute_func "download_$func"; then
+                  show_error_no_func "$func"
+                  exit 1
+               fi
+            fi
+         fi
+
+      done
+      exit 0
+   fi
+
+   # Single-option parsing
+
+   if [ "$1" == "-n" ] || [ "$1" == "--skip-install-pkgs" ]; then
+      local skip_install=1
+   fi
+
+   # Do the actual job
+
+   if [ -z "$skip_install" ]; then
+      install_packages
+   else
+      echo "*** SKIPPING installation of packages"
+   fi
+
+   echo
+   echo "*** Building the custom toolchain ***"
+   echo
+
+   for x in ${default_funcs[@]}; do
+      $x
+   done
+
+   echo
+   echo "*** Building custom toolchain COMPLETED ***"
+   echo
+}
+
+##########################################################
+# Entry point: load package funcs and run main()
+##########################################################
+
+for x in $MAIN_DIR/scripts/bash_includes/tc/*; do
+   source $x
+done
+
+if command -v sort &> /dev/null 2>&1; then
+   IFS=$'\n'
+   all_funcs_list=($(sort <<<"${all_funcs_list[*]}"))
+   unset IFS
+fi
+
+main "$@"

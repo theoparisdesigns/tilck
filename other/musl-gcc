@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+
+PROJ_DIR="@CMAKE_SOURCE_DIR@"
+TCROOT="@TCROOT@"
+ARCH="@ARCH@"
+
+if [ @USE_SYSCC@ = 0 ]; then
+   export PATH="$TCROOT/x86_gcc_toolchain_glibc/bin:$PATH"
+else
+   export SYS_CC="@SYS_CC@"
+   export SYS_CXX="@SYS_CXX@"
+   export PATH="$PROJ_DIR/scripts/build_scripts:$PATH"
+fi
+
+"$TCROOT/$ARCH/musl/install/bin/musl-gcc" "$@" -Wl,-m -Wl,@ARCH_LD_OUTPUT@

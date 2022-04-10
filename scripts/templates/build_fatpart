@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Exit on any error
+set -e
+
+maindir="@CMAKE_SOURCE_DIR@"
+bdir="@CMAKE_BINARY_DIR@"
+dest="@CMAKE_BINARY_DIR@/fatpart"
+tc="@TCROOT@"
+archgcc="@ARCH_GCC_TC@"
+strip="@STRIP@"
+gcctc="@GCC_TOOLCHAIN@"
+host_arch="@HOST_ARCH@"
+arch="@ARCH@"
+spc="@FATPART_CLUSTER_SIZE@" # sectors per cluster
+
+if [ "@HOST_ARCH@" == "x86_64" ]; then
+   if [ -f "$gcctc/$archgcc-linux-strip" ]; then
+      strip="$gcctc/$archgcc-linux-strip"
+   fi
+else
+   if [ ! -f "$strip" ]; then
+      strip="/usr/bin/env strip"
+   fi
+fi
+
+mtoolsdir=$tc/host_${host_arch}/mtools
+mformat=$mtoolsdir/mformat
+mlabel=$mtoolsdir/mlabel
+mmd=$mtoolsdir/mmd
+mcopy=$mtoolsdir/mcopy
+mdel=$mtoolsdir/mdel
+
+function strip_binary {
+   $strip -s "$1"
+}
+
+function pushd {
+   command pushd "$@" > /dev/null
+}
+
+function popd {
+   command popd "$@" > /dev/null
+}
+
+function link_or_copy {
+   if [ -n "$AZURE_HTTP_USER_AGENT" ]; then
+      cp $1 $2
+   else
+      ln $1 $2
+   fi
+}
+
+function create_fatpart_if_necessary {
+   if [ ! -f $dest ]; then
+      # If the 'fatpart' file does not already exist
+      dd status=none if=/dev/zero of=$dest bs=1M count=@INITRD_SZ_MB@
+   fi
+}
+
+function format_fatpart {
+   # mformat options
+   # -d <N> ; num of FAT copies
+   # -F     ; force FAT32 to be used
+   # -c <N> ; sectors per cluster
+   # -T <N> ; total sectors
+
+   local force_fat32=""
+
+   if [[ "$spc" == "1" ]]; then
+      force_fat32="-F"
+   fi
+
+   $mformat -i $dest -d 1 $force_fat32 -c $spc -T @INITRD_SZ_SEC@ ::
+   $mlabel -i $dest ::TILCK
+}
+
+function create_sysroot_skeleton {
+   rm -rf $bdir/sysroot
+   cp -r $maindir/sysroot $bdir/
+   cd $bdir/sysroot
+
+   # Remove the README file that is not supposed to be in the actual sysroot
+   rm README
+}
+
+# Copy the shell-script extra system tests in <SYSROOT>/usr/local/tests
+function add_script_tests {
+   mkdir -p usr/local/tests
+   cp $maindir/tests/system/scripts/* ./usr/local/tests
+}
+
+function add_apps {
+
+   IFS=";"
+   local all_apps="@USERAPPS_FILES_LIST@;@EXTRA_APPS_LIST@"
+
+   for x in ${all_apps[@]}; do
+
+      local name=$(basename -- $x)
+      local dest_dir="usr/bin"
+
+      if [[ "$name" == "init" ]]; then
+
+         dest_dir="bin"
+
+      elif [[ "$name" == "devshell" ]]; then
+
+         add_script_tests
+      fi
+
+      cp "$x" $dest_dir
+      strip_binary "$dest_dir/$name"
+
+   done
+   unset IFS
+}
+
+function add_busybox {
+   if [ -d $tc/$arch/busybox ]; then
+      link_or_copy $tc/$arch/busybox/busybox bin/
+   fi
+}
+
+function add_fat_test_dir {
+
+   if [[ "@FAT_TEST_DIR@" == "0"   ||
+         "@FAT_TEST_DIR@" == "off" ||
+         "@FAT_TEST_DIR@" == "OFF" ||
+         "@FAT_TEST_DIR@" == "false" ]]
+   then
+      return
+   fi
+
+   mkdir -p tdir
+   pushd tdir
+      for i in {0..99}; do
+         if [ $i -lt 10 ]; then
+            n="0"
+         else
+            n=""
+         fi
+         echo > test_$n$i
+      done
+   popd
+}
+
+function add_tcc {
+
+   if [ -z "@EXTRA_TCC_ENABLED@" ]; then
+      return
+   fi
+
+   local musl=@GCC_TC_SYSROOT@/lib/
+
+   mkdir -p lib/tcc
+   cp -r $tc/$arch/tcc/include lib/tcc
+   link_or_copy $tc/$arch/tcc/tcclib.h lib/tcc/include
+   link_or_copy $tc/$arch/tcc/@ARCH@-libtcc1.a lib/tcc
+   link_or_copy $tc/$arch/tcc/@ARCH@-tcc bin/tcc
+   cp -r $tc/$arch/tcc/examples lib/tcc-examples
+
+   cp -r $musl lib/@ARCH_GCC_TC@-tilck-musl
+}
+
+function add_micropython {
+
+   if [ -z "@EXTRA_MICROPYTHON_ENABLED@" ]; then
+      return
+   fi
+
+   link_or_copy $tc/$arch/micropython/ports/unix/micropython usr/bin
+}
+
+function add_fbdoom {
+
+   if [ -z "@EXTRA_FBDOOM_ENABLED@" ]; then
+      return
+   fi
+
+   mkdir -p usr/lib/fbDOOM
+   link_or_copy $tc/$arch/fbDOOM/fbdoom/fbdoom.gz usr/lib/fbDOOM
+
+   if [ -f $tc/$arch/fbDOOM/Doom1.WAD ]; then
+      local wadfile="$tc/$arch/fbDOOM/Doom1.WAD"
+   else
+      local wadfile="$tc/$arch/fbDOOM/freedoom/freedoom1.wad.gz"
+   fi
+
+   link_or_copy "$wadfile" usr/lib/fbDOOM
+
+   # Here document
+
+   (
+cat <<'EOF'
+#!/bin/sh
+
+# Exit on failure
+set -e
+fbdoomgz="/usr/lib/fbDOOM/fbdoom.gz"
+wadgz="/usr/lib/fbDOOM/freedoom1.wad.gz"
+fbdoom="/tmp/fbdoom"
+
+if [ -f /usr/lib/fbDOOM/Doom1.WAD ]; then
+   wad="/usr/lib/fbDOOM/Doom1.WAD"
+else
+   wad="/tmp/freedom1.wad"
+fi
+
+if ! [ -f $fbdoomgz ]; then
+   echo "ERROR: fbDOOM binary $fbdoomgz not found."
+   exit 1
+fi
+
+if ! [ -f $fbdoom ]; then
+   echo -n "Uncompressing ${fbdoomgz}... "
+   cp $fbdoomgz /tmp
+   gunzip -c /tmp/fbdoom.gz > $fbdoom
+   chmod 755 $fbdoom
+   rm /tmp/fbdoom.gz
+   echo "[ OK ]"
+fi
+
+if ! [ -f $wad ]; then
+
+   if ! [ -f $wadgz ]; then
+      echo "ERROR: Wad file $wadgz not found."
+      exit 1
+   fi
+
+   echo -n "Uncompressing ${wadgz}... "
+   cp $wadgz /tmp
+   gunzip -c /tmp/freedoom1.wad.gz > $wad
+   rm /tmp/freedoom1.wad.gz
+   echo "[ OK ]"
+fi
+
+echo "Running $fbdoom -iwad $wad"
+exec $fbdoom -iwad $wad
+EOF
+   ) > usr/bin/fbdoom
+
+   chmod 755 usr/bin/fbdoom
+}
+
+
+function add_vim {
+
+   if [ -z "@EXTRA_VIM_ENABLED@" ]; then
+      return
+   fi
+
+   mkdir -p usr/lib/vim
+   link_or_copy $tc/$arch/vim/install/vim.gz usr/lib/vim
+   link_or_copy $tc/$arch/vim/install/vr.tgz usr/lib/vim
+
+   mkdir -p usr/lib/vim/samples
+   cp $maindir/tests/interactive/vim_text_files/* usr/lib/vim/samples/
+}
+
+function add_tree_cmd {
+
+   if [ -z "@EXTRA_TREE_CMD_ENABLED@" ]; then
+      return
+   fi
+
+   link_or_copy $tc/$arch/tree_cmd/tree usr/bin
+}
+
+function add_lua {
+
+   if [ -z "@EXTRA_LUA_ENABLED@" ]; then
+      return
+   fi
+
+   if [ -f $tc/$arch/lua/src/lua ]; then
+      link_or_copy $tc/$arch/lua/src/lua bin/
+   fi
+
+   if [ -f $tc/$arch/lua/src/luac ]; then
+      link_or_copy $tc/$arch/lua/src/luac bin/
+   fi
+}
+
+function make_fatpart {
+
+   create_fatpart_if_necessary
+   format_fatpart
+
+   # first, create the directories
+   for f in $(find * -type d); do
+      $mmd -i $dest $f
+   done
+
+   # [debug] Create a hole (file that will be deleted later) in the fatpart.
+   # [debug] This forces the bootloaders to run fat_compact_clusters() and do
+   # [debug] some real work. Otherwise, fat_calculate_used_bytes() will return
+   # [debug] the same as fat_get_first_free_cluster_off() and we won't test
+   # [debug] that fat_compact_clusters() really works.
+   if ! [ -f hole ]; then
+      dd status=none if=/dev/zero of=hole bs=1K count=16
+   fi
+   $mcopy -i $dest hole ::/hole
+   # [end debug]
+
+   # then, copy all the files in sysroot
+   for f in $(find * -type f); do
+
+      if [[ "$(basename -- $f)" == ".gitignore" ]]; then
+         continue;
+      fi
+
+      # [debug] Skip our hole file
+      if [[ "$(basename -- $f)" == "hole" ]]; then
+         continue;
+      fi
+      # [end debug]
+
+      $mcopy -i $dest $f ::/$f
+   done
+
+   # [debug] Delete our hole file
+   $mdel -i $dest ::/hole
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+
+create_sysroot_skeleton
+
+add_apps
+add_fat_test_dir
+add_busybox
+add_tcc
+add_micropython
+add_fbdoom
+add_vim
+add_tree_cmd
+add_lua
+
+make_fatpart

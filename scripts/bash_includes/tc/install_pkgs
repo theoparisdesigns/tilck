@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# ---------------------------------------------------------------
+# NOTE
+#
+# This "script" is NOT meant to be executed directly.
+# It is included as a source file by scripts/build_toolchian.
+#
+# ---------------------------------------------------------------
+
+function install_debian_family {
+
+   echo debian > $TC/.distro
+
+   if [ "$RUNNING_IN_CI" == 1 ]; then
+      $MAIN_DIR/scripts/tc/debian/update
+   fi
+
+   pkg_list=()
+   pkg_list+=(debianutils)
+   pkg_list+=(tar)
+   pkg_list+=(grep)
+   pkg_list+=(gzip)
+   pkg_list+=(gawk)
+   pkg_list+=(wget)
+   pkg_list+=(git)
+   pkg_list+=(gcc)
+   pkg_list+=(g++)
+   pkg_list+=(make)
+   pkg_list+=(cmake)
+   pkg_list+=(binutils)
+   pkg_list+=(bzip2)
+   pkg_list+=(unzip)
+   pkg_list+=(cpio)
+   pkg_list+=(parted)
+   pkg_list+=(qemu-system-x86)
+
+   to_install=()
+   echo Checking the packages that need to be installed
+
+   for x in ${pkg_list[@]}; do
+      echo -ne "Checking $x... "
+
+      if [ "`dpkg -s $x 2>&1 | grep Status`" ]; then
+         echo OK
+      else
+         echo NOT found
+         to_install+=($x)
+      fi
+   done
+
+   echo
+
+   # Install the packages
+
+   if [ ${#to_install[@]} -ne 0 ]; then
+
+      echo ${#to_install[@]} packages need to be installed
+      tmp="${to_install[@]}"
+
+      if [ "$RUNNING_IN_CI" == 1 ]; then
+         run_command "apt install -y $tmp"
+      else
+         if ! which sudo &> /dev/null; then
+            run_command "su -c \"apt install $tmp\""
+         else
+            run_command "sudo apt install $tmp"
+         fi
+      fi
+
+   else
+      echo "You are all set, no packages need to be installed."
+   fi
+}
+
+function install_fedora {
+
+   echo fedora > $TC/.distro
+
+   if [ "$RUNNING_IN_CI" == 1 ]; then
+      $MAIN_DIR/scripts/tc/fedora/update
+   fi
+
+   pkg_list=()
+   pkg_list+=(which)
+   pkg_list+=(tar)
+   pkg_list+=(grep)
+   pkg_list+=(gzip)
+   pkg_list+=(gawk)
+   pkg_list+=(wget)
+   pkg_list+=(git)
+   pkg_list+=(gcc)
+   pkg_list+=(gcc-c++)
+   pkg_list+=(make)
+   pkg_list+=(cmake)
+   pkg_list+=(binutils)
+   pkg_list+=(bzip2)
+   pkg_list+=(unzip)
+   pkg_list+=(parted)
+   pkg_list+=(qemu-system-x86)
+
+   to_install=()
+   echo Checking the packages that need to be installed
+
+   for x in ${pkg_list[@]}; do
+      echo -ne "Checking $x... "
+
+      if dnf list installed $x &> /dev/null; then
+         echo OK
+      else
+         echo NOT found
+         to_install+=($x)
+      fi
+   done
+
+   if [ ${#to_install[@]} -ne 0 ]; then
+
+      echo ${#to_install[@]} packages need to be installed
+      tmp="${to_install[@]}"
+
+      if [ "$RUNNING_IN_CI" == 1 ]; then
+         run_command "dnf install -y $tmp"
+      else
+         run_command "sudo dnf install $tmp"
+      fi
+
+   else
+      echo "You are all set, no packages need to be installed."
+   fi
+}
+
+function install_arch {
+
+   echo arch > $TC/.distro
+
+   if [ "$RUNNING_IN_CI" == 1 ]; then
+      $MAIN_DIR/scripts/tc/arch/update
+   fi
+
+   pkg_list=()
+   pkg_list+=(which)
+   pkg_list+=(tar)
+   pkg_list+=(grep)
+   pkg_list+=(gzip)
+   pkg_list+=(gawk)
+   pkg_list+=(wget)
+   pkg_list+=(git)
+   pkg_list+=(gcc)
+   pkg_list+=(make)
+   pkg_list+=(cmake)
+   pkg_list+=(binutils)
+   pkg_list+=(bzip2)
+   pkg_list+=(unzip)
+   pkg_list+=(cpio)
+   pkg_list+=(qemu)
+   pkg_list+=(parted)
+   pkg_list+=(qemu-arch-extra)
+
+   to_install=()
+   echo Checking the packages that need to be installed
+
+   for x in ${pkg_list[@]}; do
+      echo -ne "Checking $x... "
+
+      if pacman -Q $x &> /dev/null; then
+         echo OK
+      else
+         echo NOT found
+         to_install+=($x)
+      fi
+   done
+
+   if [ ${#to_install[@]} -ne 0 ]; then
+
+      echo ${#to_install[@]} packages need to be installed
+      tmp="${to_install[@]}"
+
+      if [ "$RUNNING_IN_CI" == 1 ]; then
+         run_command "pacman -S --noconfirm $tmp"
+      else
+         run_command "sudo pacman -S $tmp"
+      fi
+
+   else
+      echo "You are all set, no packages need to be installed."
+   fi
+}
+
+function install_openSUSE {
+
+   echo opensuse > $TC/.distro
+
+   if [ "$RUNNING_IN_CI" == 1 ]; then
+      $MAIN_DIR/scripts/tc/opensuse/update
+   fi
+
+   pkg_list=()
+   pkg_list+=(which)
+   pkg_list+=(tar)
+   pkg_list+=(grep)
+   pkg_list+=(gzip)
+   pkg_list+=(gawk)
+   pkg_list+=(glibc-locale-base)
+   pkg_list+=(wget)
+   pkg_list+=(git-core)
+   pkg_list+=(gcc)
+   pkg_list+=(gcc-c++)
+   pkg_list+=(make)
+   pkg_list+=(cmake)
+   pkg_list+=(binutils)
+   pkg_list+=(bzip2)
+   pkg_list+=(unzip)
+   pkg_list+=(parted)
+   pkg_list+=(qemu-x86)
+
+   to_install=()
+   echo Checking the packages that need to be installed
+
+   for x in ${pkg_list[@]}; do
+      echo -ne "Checking $x... "
+
+      if rpm -q $x &> /dev/null; then
+         echo OK
+      else
+         echo NOT found
+         to_install+=($x)
+      fi
+   done
+
+   if [ ${#to_install[@]} -ne 0 ]; then
+
+      echo ${#to_install[@]} packages need to be installed
+      tmp="${to_install[@]}"
+
+      if [ "$RUNNING_IN_CI" == 1 ]; then
+         run_command "zypper install -y $tmp"
+      else
+         run_command "sudo zypper install $tmp"
+      fi
+
+   else
+      echo "You are all set, no packages need to be installed."
+   fi
+}
+
+function install_packages {
+
+   rel_files=`echo /etc/*release`
+   lsb="/etc/lsb-release"
+   os_rel="/etc/os-release"
+
+   if ! [ -f /bin/grep ] && ! [ -f /usr/bin/grep ]; then
+      if ! echo 'aaa bbb' | grep aaa &> /dev/null; then
+
+         echo "The command 'grep' has not been found on the system."
+         echo "We cannot even detect the current linux distribution."
+         echo "Please, install at least grep."
+         exit 1
+      fi
+   fi
+
+   # Where lsb-release exists, use only it.
+   # On Mint doing grep /etc/*release reports an error because there is an
+   # upstream-release directory matching that wildcard. Using grep -r is not
+   # a solution since in /etc/upstream-release/* on Mint, Ubuntu is mentioned.
+   if [ -f $lsb ] && [ "$(grep -Ei 'buntu|mint' $lsb)" ]; then
+
+      echo "Distribution detected: Ubuntu (any) or Mint"
+      echo ""
+      install_debian_family
+
+   # Debian does not contain the lsb-release file.
+   elif [ -f $os_rel ] && [ "$(grep -Ei 'debian' $os_rel)" ]; then
+
+      echo "Distribution detected: Debian"
+      echo ""
+      install_debian_family
+
+   # On Fedora, we need to check if exactly a [Ff]edora-release file exists.
+   elif echo $rel_files | grep -Ei 'fedora' - &> /dev/null; then
+
+      echo "Distribution detected: Fedora"
+      echo ""
+      install_fedora
+
+   elif echo $rel_files | grep -Ei 'arch|manjaro' - &> /dev/null; then
+
+      echo "Distribution detected: Arch or Manjaro"
+      echo ""
+      install_arch
+
+   elif [ -f $os_rel ] && [ "$(grep -Ei 'openSUSE' $os_rel)" ]; then
+
+      echo "Distribution detected: openSUSE"
+      echo ""
+      install_openSUSE
+
+   else
+
+      full_list=()
+      full_list+=(wget)
+      full_list+=(tar)
+      full_list+=(grep)
+      full_list+=(gzip)
+      full_list+=(gawk)
+      full_list+=(git)
+      full_list+=(gcc)
+      full_list+=(g++)
+      full_list+=(make)
+      full_list+=(cmake)
+      full_list+=(objdump)
+      full_list+=(rpm2cpio)
+      full_list+=(cpio)
+      full_list+=(bzip2)
+      full_list+=(unzip)
+      full_list+=(parted)
+      full_list+=(qemu-system-i386)
+
+      to_install_list=()
+      which_installed=0
+
+      if which bash &> /dev/null; then
+         which_installed=1
+      else
+         to_install_list+=(which)
+      fi
+
+      for x in ${full_list[@]}; do
+         if [ "$which_installed" == 1 ]; then
+            if ! which $x &> /dev/null; then
+               to_install_list+=($x)
+            fi
+         else
+            to_install_list+=($x)
+         fi
+      done
+
+      if [ ${#to_install_list[@]} -ne 0 ]; then
+
+         echo "Your distribution is not fully supported by this script."
+         echo "The supported distros are:"
+         echo "  * Ubuntu"
+         echo "  * Mint"
+         echo "  * Debian"
+         echo "  * Fedora"
+         echo "  * Arch"
+         echo "  * Manjaro"
+         echo "  * openSUSE"
+         echo "In order to build Tilck on this distro, please make sure the "
+         echo "following programs are installed:"
+
+         for x in ${to_install_list[@]}; do
+            echo "  * $x"
+         done
+
+         echo "After that, re-run this script with --skip-install-pkgs"
+         exit 1
+
+      fi
+   fi
+
+}

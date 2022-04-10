@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+if ! git --version &> /dev/null; then
+   echo "<unknown commit>"
+   exit 0
+fi
+
+set -e
+ver=`git rev-parse --short=8 HEAD`
+commit_date=`git --no-pager log -1 --format="%ai"`
+
+if [[ $(git diff --stat) != '' ]]; then
+
+   echo "dirty:$ver $commit_date"
+
+else
+
+   tags=""
+   for x in `git tag --points-at HEAD`; do
+      tags="$tags$x,"
+   done
+
+   if [[ "$tags" != "" ]]; then
+
+      # Prepend "tags:"
+      tags="tags:$tags"
+
+      # Drop the trailing ","
+      tags=$(echo $tags | sed 's/.$//')
+   fi
+
+   echo "$ver $commit_date $tags"
+fi

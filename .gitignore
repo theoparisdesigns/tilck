@@ -1,0 +1,17 @@
+build/
+bochsrc-disk.bxrc
+bochsrc.bxrc
+toolchain/
+toolchain2/
+.gdb_history
+GPATH
+GRTAGS
+GTAGS
+rel_build/*
+.vscode/ipch/
+other_build*
+tcci_*
+.mypy_cache
+.vscode/.ropeproject
+__pycache__
+.gcc_tc_ver

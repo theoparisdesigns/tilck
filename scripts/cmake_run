@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Constants
+GCC_MIN_VERSION="4.8.0"
+GXX_MIN_VERSION="4.8.0"
+
+# Project's root directory
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAIN_DIR="$(cd $SOURCE_DIR/.. && pwd)"
+
+source $MAIN_DIR/scripts/bash_includes/script_utils
+
+if [[ "$1" == "--contrib" ]]; then
+
+   export CC='clang'
+   export CXX='clang++'
+   CMAKE_ARGS="-DKERNEL_SYSCC=1 -DWCONV=1 -DKMALLOC_HEAVY_STATS=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DTIMER_HZ=250 -DTERM_BIG_SCROLL_BUF=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_RESCHED_ENABLE_PREEMPT=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKERNEL_UBSAN=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DBOOTLOADER_POISON_MEMORY=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKMALLOC_FREE_MEM_POISONING=1"
+   export CMAKE_ARGS
+
+   echo
+   echo -e "${YELLOW}Contributor mode${RATTRS}: "
+   echo
+   echo -e "   - CC=${LMAGENTA}'${CC}'${RATTRS}"
+   echo -e "   - CXX=${LMAGENTA}'${CXX}'${RATTRS}"
+   echo -e "   - CMAKE_ARGS=${LMAGENTA}'${CMAKE_ARGS}'${RATTRS}"
+   echo
+
+elif [[ "$1" == "--intr" ]]; then
+
+   export CC="gcc"
+   export CXX="g++"
+   CMAKE_ARGS="-DFB_CONSOLE_BANNER=0 -DFB_CONSOLE_CURSOR_BLINK=0"
+   CMAKE_ARGS="$CMAKE_ARGS -DFB_CONSOLE_USE_ALT_FONTS=0 -DTTY_COUNT=2"
+   CMAKE_ARGS="$CMAKE_ARGS -DEXTRA_VIM=1 -DKRN_NO_SYS_WARN=0"
+   CMAKE_ARGS="$CMAKE_ARGS -DBOOT_INTERACTIVE=0 -DPREFERRED_GFX_MODE_W=640"
+   CMAKE_ARGS="$CMAKE_ARGS -DPREFERRED_GFX_MODE_H=480 -DMOD_acpi=0"
+   export CMAKE_ARGS
+
+   echo
+   echo -e "${YELLOW}Interactive tests mode${RATTRS}"
+   echo
+   echo -e "   - CC=${LMAGENTA}'${CC}'${RATTRS}"
+   echo -e "   - CXX=${LMAGENTA}'${CXX}'${RATTRS}"
+   echo -e "   - TEST_GCOV=${LMAGENTA}'${TEST_GCOV}'${RATTRS}"
+   echo -e "   - KERNEL_GCOV=${LMAGENTA}'${KERNEL_GCOV}'${RATTRS}"
+   echo -e "   - CMAKE_ARGS=${LMAGENTA}'${CMAKE_ARGS}'${RATTRS}"
+   echo
+
+fi
+
+curr_dir="`pwd`"
+
+if [[ "$curr_dir" == "$MAIN_DIR" ]]; then
+   build_dir="$MAIN_DIR/build"
+   mkdir -p "$build_dir"
+else
+   build_dir="$curr_dir"
+fi
+
+echo "[cmake_run] Using '$build_dir' as build directory"
+
+# If CC is set but the file $CC does not exist
+# replace CC with `which $CC` (its absolute path)
+if [ -n "$CC" ] && [ ! -f "$CC" ]; then
+   CC="`which $CC`"
+fi
+
+# If CXX is set but the file $CXX does not exist
+# replace CXX with `which $CXX` (its absolute path)
+if [ -n "$CXX" ] && [ ! -f "$CXX" ]; then
+   CXX="`which $CXX`"
+fi
+
+# Check compiler's version only if this is the first time we ran CMake:
+# after that, CMake will cache compiler's information and changing CC/CXX
+# won't affect the build at all.
+
+if ! [ -f "$build_dir/CMakeCache.txt" ]; then
+
+   if [ -z "$CC" ]; then
+      CC="gcc"
+   fi
+
+   if [ -z "$CXX" ]; then
+      CXX="g++"
+   fi
+
+   if ! which $CC &> /dev/null; then
+      echo "CC compiler '$CC' not found."
+      exit 1
+   fi
+
+   if ! which $CXX &> /dev/null; then
+      echo "CXX compiler '$CXX' not found."
+      exit 1
+   fi
+
+   if $CC --version | grep gcc &> /dev/null; then
+      ver=$(generic_get_version_str $CC)
+      fail_if_too_old $CC $ver $GCC_MIN_VERSION
+   fi
+
+   if $CXX --version | grep g++ &> /dev/null; then
+      ver=$(generic_get_version_str $CXX)
+      fail_if_too_old $CXX $ver $GXX_MIN_VERSION
+   fi
+fi
+
+export CC
+export CXX
+
+
+if [ -f $MAIN_DIR/toolchain2/host_x86_64/cmake/bin/cmake ]; then
+   export CMAKE="$MAIN_DIR/toolchain2/host_x86_64/cmake/bin/cmake"
+else
+   export CMAKE="cmake"
+fi
+
+if [[ "$RELEASE" == "1" || "$REL" == "1" ]]; then
+   BUILD_TYPE="Release"
+else
+   BUILD_TYPE="Debug"
+fi
+
+
+echo "[cmake_run] Using '$CMAKE' as CMake executable"
+
+cd $build_dir
+
+$CMAKE                                 \
+   -DCMAKE_BUILD_TYPE=$BUILD_TYPE      \
+   -DCMAKE_EXPORT_COMPILE_COMMANDS=1   \
+   $CMAKE_ARGS "$@" "$MAIN_DIR"

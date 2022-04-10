@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# pylint: disable=unused-wildcard-import
+
+import os
+import re
+import sys
+import time
+import signal
+import subprocess
+import threading
+import struct
+import zlib
+import base64
+import fcntl
+import argparse
+from collections import namedtuple
+
+# Constants coming from CMake (this file gets pre-processed by CMake)
+RUNNERS_DIR = '@CMAKE_SOURCE_DIR@/tests/runners'
+KERNEL_FILE = '@KERNEL_FILE@'
+BUILD_DIR = '@CMAKE_BINARY_DIR@'
+FATPART_FILE = '@CMAKE_BINARY_DIR@/fatpart'
+GEN_KCOV_REPORT = '@CMAKE_BINARY_DIR@/scripts/generate_kernel_coverage_report'
+KERNEL_FORCE_TC_ISYSTEM = '@KERNEL_FORCE_TC_ISYSTEM@'
+
+sys.path.append(RUNNERS_DIR)
+from lib.utils import *
+from lib.detect_kvm import *
+from lib.env import *
+from lib.exceptions import *
+
+# Runtime-generated constants
+r_notInBase64Char = re.compile(r'[^A-Za-z0-9+/=]')
+
+# Runtime-generated types
+TestParamsType = namedtuple(
+   'TestParamsType', ['type', 'name', 'timeout']
+)
+
+# Other constants
+INIT_PATH = '/initrd/bin/init'
+DEVSHELL_PATH = '/initrd/usr/bin/devshell'
+KERNEL_HELLO_MSG = 'Hello from Tilck!'
+
+# Global variables
+
+# Controlled by command line
+g_params:TestParamsType = None
+
+# Internal state
+g_output = ""
+g_process = None
+g_hello_msg_found = False
+g_shell_exit_code = None
+g_dumping_gcda_files = False
+g_gcda_buf = None
+g_gcda_file = None
+
+def set_once_shell_exit_code(val: int):
+
+   global g_shell_exit_code
+
+   if g_shell_exit_code is None:
+      g_shell_exit_code = val
+
+def set_once_qemu_process(p):
+   global g_process
+   assert(g_process is None)
+   g_process = p
+
+def append_to_output(s: str):
+   global g_output
+   g_output += s
+
+def write_gcda_file_wrapper():
+
+   global g_gcda_file, g_gcda_buf
+
+   if not write_gcda_file(g_gcda_file, g_gcda_buf):
+      g_process.send_signal(signal.SIGINT)
+
+   g_gcda_file = None
+   g_gcda_buf = None
+
+def handle_hello_msg(line: str):
+
+   global g_hello_msg_found
+
+   if not g_hello_msg_found:
+      g_hello_msg_found = True
+      raw_print(line)
+      return
+
+   # Bad case
+   msg_print("")
+   msg_print("Detected TWICE the kernel hello msg: the machine rebooted.")
+   msg_print("KILLING the VM.")
+
+   set_once_fail_reason(Fail.reboot)
+   g_process.send_signal(signal.SIGINT)
+
+def process_line(line: str):
+
+   global g_dumping_gcda_files
+   global g_gcda_buf
+   global g_gcda_file
+
+   stripped = line.rstrip()
+   #raw_print(stripped)
+
+   if stripped and stripped[0] == '[' and stripped.startswith('[init]'):
+
+      m = re.search(
+         r'the shell with pid ([0-9]+) exited with status: ([0-9]+)',
+         stripped
+      )
+
+      if m:
+         set_once_shell_exit_code(int(m.group(2)))
+         g_dumping_gcda_files = False
+         raw_print(stripped)
+         return
+
+   if stripped.find(KERNEL_HELLO_MSG) != -1:
+      handle_hello_msg(stripped)
+      return
+
+   # NOTE: we could kill the VM immediately after a kernel panic, but we'll
+   # loose the backtrace. TODO: detect kernel panic here, but kill the VM after
+   # some timeout (e.g. 1 sec).
+   #
+   # if stripped.find("KERNEL PANIC") != -1:
+   #    raw_print("[system test runner] Detected kernel panic: KILLING the VM.")
+   #    set_once_fail_reason(Fail.panic)
+   #    g_process.send_signal(signal.SIGINT)
+
+   if not g_dumping_gcda_files:
+
+      append_to_output(stripped + "\n")
+      raw_print(stripped)
+
+      if stripped.find(KERNEL_DUMP_GCDA_STR) != -1:
+         g_dumping_gcda_files = True
+
+      return
+
+   # Dumping gcda file
+
+   if not stripped:
+      return
+
+   if r_notInBase64Char.search(stripped[0]):
+
+      if g_gcda_file:
+         write_gcda_file_wrapper()
+
+      g_dumping_gcda_files = False
+      raw_print(stripped)
+      return
+
+   m = re.search(r'file: (.+)', stripped)
+
+   if m:
+
+      if g_gcda_file:
+         write_gcda_file_wrapper()
+
+      g_gcda_file = m.group(1)
+      g_gcda_buf = ''
+
+   else:
+      g_gcda_buf += stripped
+
+def process_text(text: str, first_output: bool):
+
+   # python's split always leaves an empty element in case of a trailing
+   # delimiter. For example:
+   #
+   #     "a,b,c,".split(",")
+   #
+   # produces
+   #
+   #     ["a", "b", "c", ""]
+   #
+   # Therefore, it's always OK to discard the last line and return it, to
+   # be used for the next (which will be appended to it).
+
+   lines = text.split("\n")
+
+   if first_output:
+
+      # Unfortunately, newer versions of QEMU (like 4.x+) dump of ESC sequences
+      # when the serial port is used as "monitor" in order to clear the screen,
+      # move the cursor to 1,1 etc. We *MUST* skip those sequences because we
+      # really really don't want the screen to be cleared between one test run
+      # and another.
+
+      if lines[0].startswith("\033c"):
+
+         i = lines[0].find("SeaBIOS")
+
+         if i != -1:
+            lines[0] = lines[0][i:] # Skip until SeaBIOS
+         else:
+            lines[0] = lines[0][2:] # Just skip the ESC c sequence
+
+   for ln in lines[:-1]:
+      process_line(ln)
+
+   return lines[-1]
+
+def run_the_vm():
+
+   global g_dumping_gcda_files
+   global g_gcda_buf
+   global g_gcda_file
+
+   args = ['qemu-system-i386',
+           '-m', str(VM_MEMORY_SIZE_IN_MB),
+           '-kernel', KERNEL_FILE,
+           '-nographic', '-device',
+           'isa-debug-exit,iobase=0xf4,iosize=0x04']
+
+   if is_kvm_installed():
+      args += ['-enable-kvm', '-cpu', 'host']
+
+   kernel_cmdline = '-sercon -noacpi '
+   cmdline = DEVSHELL_PATH
+   init_opts = '-nr -e'
+
+   if DUMP_COV:
+      cmdline += ' -dcov'
+      init_opts += ' -q'
+
+   if IN_ANY_CI:
+      kernel_cmdline += ' -sat' # enable sched alive (debug) thread
+
+   if g_params.type == 'shellcmd':
+
+      raw_print(
+         "Running the VM with shell command '{}'...".format(g_params.name)
+      )
+      cmdline += ' -c ' + g_params.name
+
+   elif g_params.type == 'selftest':
+
+      raw_print("Running the VM with selftest '{}'...".format(g_params.name))
+      cmdline += ' -c selftest ' + g_params.name
+      init_opts += ' -ns'
+
+   else:
+      sys.exit(Fail.invalid_args.value)
+
+   kernel_cmdline += ' -cmd {} {} -- {}'.format(INIT_PATH, init_opts, cmdline)
+   args += ['-initrd', FATPART_FILE, '-append', kernel_cmdline]
+
+   if VERBOSE:
+      raw_print(" ".join(args))
+
+   raw_print('-' * 80)
+   raw_print("")
+
+   # Run the QEMU process by using a PIPE for its stdout
+   p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+   set_once_qemu_process(p)
+
+   # Make the `stdout` file descriptor non-blocking
+   fh_set_blocking_mode(g_process.stdout, False)
+
+   read_anything = False
+   first_output = True
+   start_time = time.time()
+   incomplete_line = ''
+
+   while True:
+
+      text = g_process.stdout.read()
+
+      # In python 3, read() will return None when there's nothing to read on
+      # a non-blocking stream. On python 2 instead, it used to throw an IOError
+      # and return None only in case of EOF. Now, apprently, there's no way to
+      # detect the EOF case. Therefore, g_process.poll() is used. It returns
+      # process' exit-code if the process terminated, otherwise None.
+      if not text:
+
+         if g_process.poll() is not None:
+
+            if incomplete_line:
+               process_line(incomplete_line)
+
+            break # The process exited, we have to stop reading
+
+         if not read_anything:
+            time.sleep(0.1)
+            continue
+
+         curr_time = time.time()
+         e = curr_time - start_time
+
+         if e >= 1.0:
+            msg_print("WARNING: got nothing in {:.2f} sec".format(e))
+            start_time = curr_time
+
+         time.sleep(0.1)
+         continue
+
+      if not read_anything:
+         elapsed = time.time() - start_time
+         read_anything = True
+         msg_print("First output after {:.2f} s".format(elapsed))
+
+      start_time = time.time()
+      text = incomplete_line + text.decode('latin-1')
+      incomplete_line = process_text(text, first_output)
+
+      if read_anything:
+         first_output = False
+
+   raw_print('-' * 80)
+
+def generate_coverage_if_enabled():
+
+   if not DUMP_COV or not REPORT_COV:
+      return # Just do nothing
+
+   if not run_gen_coverage_report_tool(GEN_KCOV_REPORT):
+      sys.exit(Fail.gcov_error.value)
+
+def arg_type_timeout(s):
+
+   try:
+
+      value = int(s)
+
+      if value <= 0:
+         raise TypeError()
+
+   except:
+
+      raise argparse.ArgumentTypeError("expected a positive integer")
+
+   return value
+
+###############################################################################
+
+def main():
+
+   global g_params
+   set_runner_name("single test runner")
+
+   parser = argparse.ArgumentParser()
+
+   parser.add_argument(
+      'test_type',
+      choices = ['selftest', 'shellcmd'],
+      help = 'type of the test'
+   )
+
+   parser.add_argument(
+      'test_name',
+      type = str,
+      help = 'name of the test to run'
+   )
+
+   parser.add_argument(
+      'timeout',
+      type = arg_type_timeout,
+      help = 'max test run time before timeout (seconds)'
+   )
+
+   parser.add_argument(
+      'qemu_kvm_version',
+      nargs = "?",
+      help = argparse.SUPPRESS
+   )
+
+   try:
+      args = parser.parse_args()
+   except SystemExit:
+      sys.exit(Fail.invalid_args.value)
+
+   g_params = TestParamsType(args.test_type, args.test_name, args.timeout)
+
+   if args.qemu_kvm_version:
+      set_qemu_kvm_version(args.qemu_kvm_version)
+
+   if is_cmake_opt_enabled(KERNEL_FORCE_TC_ISYSTEM):
+      unrunnable_build_graceful_exit()
+
+   detect_kvm()
+   thread = threading.Thread(target = run_the_vm)
+   thread.start()
+
+   try:
+      thread.join(g_params.timeout)
+   except KeyboardInterrupt:
+      msg_print("KeyboardInterrupt")
+      sys.exit(Fail.user_interruption.value)
+
+   if thread.is_alive():
+
+      # If we get here, after `g_params.timeout`, the test is still running
+
+      if g_dumping_gcda_files:
+         # If we're just dumping the GCDA file, wait a little more
+         thread.join(30)
+
+      if thread.is_alive():
+         # We have to fail with timeout
+         set_once_fail_reason(Fail.timeout)
+         print_timeout_kill_vm_msg(g_params.timeout)
+         g_process.send_signal(signal.SIGINT)
+         thread.join()
+
+   if g_gcda_file:
+      write_gcda_file_wrapper()
+
+   if g_output.find("KERNEL PANIC") != -1:
+      set_once_fail_reason(Fail.panic)
+
+   if no_failures() and g_shell_exit_code != 0:
+
+      if g_shell_exit_code is not None:
+         msg_print("Shell exited with code {}.".format(g_shell_exit_code))
+         set_once_fail_reason(Fail.shell_no_zero_exit)
+      else:
+         msg_print("UNKNOWN shell exit code")
+         set_once_fail_reason(Fail.shell_unknown_exit_code)
+
+   if no_failures():
+      generate_coverage_if_enabled()
+
+   sys.exit(get_fail_reason().value)
+
+###############################
+if __name__ == '__main__':
+   main()

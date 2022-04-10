@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Exit on any error
+set -e
+
+maindir="@CMAKE_SOURCE_DIR@"
+bdir="@CMAKE_BINARY_DIR@"
+dest="@CMAKE_BINARY_DIR@/test_fatpart"
+tc="@TCROOT@"
+host_arch="@HOST_ARCH@"
+
+mtoolsdir=$tc/host_${host_arch}/mtools
+mformat=$mtoolsdir/mformat
+mlabel=$mtoolsdir/mlabel
+mmd=$mtoolsdir/mmd
+mcopy=$mtoolsdir/mcopy
+
+
+if [ ! -f $dest ]; then
+   # If the 'fatpart' file does not already exist
+   dd status=none if=/dev/zero of=$dest bs=1M count=35
+fi
+
+# mformat options
+# -d <N> ; num of FAT copies
+# -F     ; force FAT32 to be used
+# -c <N> ; sectors per cluster
+# -t <N> ; cylinders
+# -h <N> ; heads
+# -s <N> ; sectors
+$mformat -i $dest -d 1 -F -c 1 -t 70 -h 16 -s 63 ::
+$mlabel -i $dest ::TILCK
+
+rm -rf $bdir/test_sysroot
+mkdir $bdir/test_sysroot
+cp -r $maindir/tests/unit/test_sysroot $bdir/
+cd $bdir/test_sysroot
+
+# Create file with random data
+dd if=/dev/urandom of=./bigfile bs=1 count=1048599 # 1 MB + 23 bytes
+
+# first, create the directories
+for f in $(find * -type d); do
+   $mmd -i $dest $f
+done
+
+# then, copy all the files in sysroot
+for f in $(find * -type f); do
+   $mcopy -i $dest $f ::/$f
+done

@@ -1,0 +1,45 @@
+#!/bin/sh
+
+# Symlink the essential directories from /initrd to /
+dirs="bin etc usr lib"
+
+for d in $dirs; do
+
+   if ! [ -d /initrd/$d ]; then
+      continue
+   fi
+
+   mkdir -p $d
+   for x in /initrd/$d/*; do
+
+      if [ -f $x ]; then
+
+         ln -s $x $d/
+
+      elif [ -d $x ]; then
+
+         dname=$(basename $x)
+         mkdir -p /$d/$dname
+
+         for y in /initrd/$d/$dname/*; do
+
+            if [ "$y" = "/initrd/$d/$dname/*" ]; then
+               break
+            fi
+
+            ln -s $y /$d/$dname/
+         done
+      fi
+   done
+done
+
+# Create symlinks for all the busybox's applets
+/initrd/bin/busybox --install -s /bin
+
+# Create a symlink for the `env` applet in /usr/bin/env
+ln -s /initrd/bin/busybox /usr/bin/env
+
+# Create symlinks for some devshell cmds
+cd /usr/bin
+ln -s devshell runall
+ln -s devshell selftest

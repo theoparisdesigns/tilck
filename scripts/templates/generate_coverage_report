@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# If TEST_GCOV is empty/unset but TRAVIS/CIRCLECI is set, exit
+# In other words, the TEST_GCOV controls this script only if it is running
+# under TRAVIS or CIRCLECI, which makes sense.
+
+if [[ "$TRAVIS" != "" || "$CIRCLECI" != "" ]]; then
+   if [[ "$TEST_GCOV" == "" ]]; then
+      echo "Exit 0 without doing anything"
+      exit 0
+   fi
+fi
+
+set -e # exit if any command fails
+
+source @CMAKE_SOURCE_DIR@/scripts/bash_includes/script_utils
+
+TC="@TCROOT@"
+BUILD="@CMAKE_BINARY_DIR@"
+
+HTML_DIR="@COVERAGE_HTML_DIR@"
+GCOV="@TOOL_GCOV@"
+
+LCOV_DIR="$TC/noarch/lcov-@LCOV_VER@"
+LCOV="$LCOV_DIR/bin/lcov"
+GENHTML="$LCOV_DIR/bin/genhtml"
+
+function show_help {
+   echo "Usage:"
+   echo "      <no options>    collect coverage info from the *.gcda files "
+   echo "                      DISCARDING any previous coverage.info data, "
+   echo "                      producing a converage.info file"
+   echo
+   echo "      --clean         clean any coverage files previously generated "
+   echo "                      and exit"
+   echo
+   echo "      --acc           collect coverage info WITHOUT DISCARDING the"
+   echo "                      previous converage.info data, producing a new"
+   echo "                      converage.info file"
+   echo
+   echo "      --codecov       only upload the coverage data to CodeCov "
+   echo "                      assuming that 'coverage.info' exists"
+   echo
+   echo "      --gen           only generate html coverage output assuming that"
+   echo "                      the file 'converage.info' exists"
+   echo
+   echo "      --info          show configuration info"
+   echo "      --help          show this help message"
+}
+
+function show_config_info {
+   echo "GCOV:       $GCOV"
+   echo "LCOV:       $LCOV"
+   echo "GENHTML:    $GENHTML"
+   echo "BUILD_DIR:  $BUILD"
+   echo "HTML_DIR:   $HTML_DIR"
+}
+
+function gen_html_coverage {
+
+   if [ ! -f coverage.info ]; then
+      echo "ERROR: the file coverage.info does NOT exist."
+      exit 1
+   fi
+
+   # (Eventually) remove and create the output coverage directory
+   rm -rf "$HTML_DIR"; mkdir -p "$HTML_DIR"
+
+   # Generate the HTML coverage output
+   $GENHTML --output-directory "$HTML_DIR" coverage.info
+}
+
+function remove_gcda_files {
+   find . -type f -name '*.gcda' -print | xargs /bin/rm -f
+}
+
+function remote_all_lcov_files {
+   rm -f lcov.info coverage.info
+}
+
+echo "Entering in the build directory: '$BUILD'"
+cd "$BUILD"
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+   show_help
+   exit 0
+fi
+
+if [[ "$1" == "--info" ]]; then
+   show_config_info
+   exit 0
+fi
+
+if [[ "$1" == "--clean" ]]; then
+   remove_gcda_files
+   remote_all_lcov_files
+   exit 0
+fi
+
+echo "NOTE: Use '$GCOV' as gcov tool"
+
+if [[ "$1" == "--gen" ]]; then
+   gen_html_coverage
+   exit 0
+fi
+
+if [[ "$1" == "--codecov" ]]; then
+
+   if [ ! -f coverage.info ]; then
+      echo "ERROR: the file coverage.info does NOT exist."
+      exit 1
+   fi
+
+   if [[ "$CODECOV_TOKEN" == "" ]]; then
+
+      #
+      # CodeCov does not need CODECOV_TOKEN to be defined for public projects
+      # on some CI providers: TravisCI, CircleCI, AppVeyor, Azure Pipelines,
+      # or GitHub Actions.
+      #
+      # See: https://docs.codecov.io/docs/about-the-codecov-bash-uploader
+      #
+
+      echo "WARNING: No CODECOV_TOKEN defined. Upload to CodeCov might fail"
+   fi
+
+   # Remove other files to be sure CodeCov uses only the coverage.info file
+   rm -f lcov.info
+   remove_gcda_files
+
+   # Upload report to CodeCov
+
+   if ! bash <(curl -s https://codecov.io/bash) -X gcov; then
+
+      echo "ERROR: codecov did not collect coverage reports"
+      echo "Trying again in 1 minute..."
+      sleep 60
+
+      if ! bash <(curl -s https://codecov.io/bash) -X gcov; then
+         echo "FATAL ERROR: Codecov cannot collect the coverage reports"
+         exit 1
+      fi
+   fi
+
+   exit 0
+fi
+
+
+gcda_count=$(find . -name '*.gcda' | wc -l)
+
+if [[ $gcda_count == 0 ]]; then
+   echo "ERROR: no gcda files found in $BUILD"
+   exit 1
+fi
+
+if [[ "$1" != "--acc" ]]; then
+   remote_all_lcov_files
+fi
+
+exclude_dirs="'@TCROOT@/*' '/usr/include/*'"
+run_command "$LCOV -d . --capture --gcov-tool '$GCOV' -o lcov.info"
+run_command "$LCOV --remove lcov.info $exclude_dirs -o lcov.info"
+
+if [[ "$1" == "--acc" && -f coverage.info ]]; then
+   $LCOV -a coverage.info -a lcov.info -o merged.info
+   mv merged.info coverage.info
+else
+   mv lcov.info coverage.info
+fi
+
+# Remove everything except for our `coverage.info`
+rm -f lcov.info
+remove_gcda_files

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+CMAKE_VERSION_TO_DOWNLOAD="3.23"
+CMAKE_MIN_VERSION="3.2.0"
+
+function download_cmake_internal {
+
+   show_work_on_component_msg "CMAKE"
+
+   local ver1=$(get_version_comp $CMAKE_VERSION_TO_DOWNLOAD 1)
+   local ver2=$(get_version_comp $CMAKE_VERSION_TO_DOWNLOAD 2)
+   local ver3=$(get_version_comp $CMAKE_VERSION_TO_DOWNLOAD 3)
+
+   local filename=cmake-${ver1}.${ver2}.${ver3}-Linux-x86_64
+   local tarname=$filename.tar.gz
+
+   download_file_in_cache "https://cmake.org/files/v${ver1}.${ver2}" "$tarname"
+   extract_cachefile_tar_gz $tarname $filename cmake
+
+   CMAKE=$TC/host_$HOST_ARCH/cmake/bin/cmake
+}
+
+all_funcs_list+=(download_cmake)
+function download_cmake {
+
+   pushd host_$HOST_ARCH
+
+   if ! [ -d cmake ]; then
+
+      if ! cmake --version &> /dev/null || [[ "$NO_SYS_CMAKE" == 1 ]]; then
+
+         if [[ "$NO_SYS_CMAKE" == 1 ]] && which cmake &> /dev/null; then
+            echo "Note: NO_SYS_CMAKE=1"
+         fi
+
+         if [[ "$HOST_ARCH" == "$BUILD_ARCH" ]]; then
+            # Default case: we have to download CMake.
+            download_cmake_internal
+         else
+            echo "ERROR: cmake >= 3.2 NOT FOUND on the system"
+            echo "In this *unofficially* supported scenario where HOST_ARCH !="
+            echo " $BUILD_ARCH you have to manually install cmake on the system"
+            exit 1
+         fi
+
+      else
+
+         # CMake is installed: let's check its version
+         local ver=$(generic_get_version_str cmake)
+         local major=$(get_version_comp $ver 1)
+         local minor=$(get_version_comp $ver 2)
+
+         local min_major=$(get_version_comp $CMAKE_MIN_VERSION 1)
+         local min_minor=$(get_version_comp $CMAKE_MIN_VERSION 2)
+
+         if [ $major -lt $min_major ]; then
+
+            # The installed CMake is too old.
+            download_cmake_internal
+
+         elif [ $major -eq $min_major ] && [ $minor -lt $min_minor ]; then
+
+            # The installed CMake is too old.
+            download_cmake_internal
+
+         else
+
+            # The installed version is >= $CMAKE_MIN_VERSION. Using it.
+            CMAKE=cmake
+            echo "NOTE: Using system's CMake (version $major.$minor)"
+
+         fi
+
+      fi
+
+   else
+      show_skip_component_msg "CMAKE"
+   fi
+
+   popd
+}

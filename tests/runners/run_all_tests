@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# pylint: disable=unused-wildcard-import
+
+import os
+import re
+import sys
+import time
+import signal
+import argparse
+import subprocess
+import threading
+import concurrent.futures as ft
+from typing import List, Dict, Tuple
+
+# Constants coming from CMake (this file gets pre-processed by CMake)
+RUNNERS_DIR = '@CMAKE_SOURCE_DIR@/tests/runners'
+KERNEL_FILE = '@KERNEL_FILE@'
+BUILD_DIR = '@CMAKE_BINARY_DIR@'
+KERNEL_FORCE_TC_ISYSTEM = '@KERNEL_FORCE_TC_ISYSTEM@'
+
+sys.path.append(RUNNERS_DIR)
+from lib.utils import *
+from lib.detect_kvm import *
+from lib.env import *
+from lib.exceptions import *
+
+# Constants
+
+TIMEOUTS = {
+   'short': 12,
+   'med': 36,
+   'medlong': 72,
+   'long': 108,
+}
+
+INV_TIMEOUTS = { TIMEOUTS[k]: k for k in TIMEOUTS }
+INF_STR_TIMEOUTS = ['any', 'all', 'inf']
+
+ordered_timeouts = sorted(list(INV_TIMEOUTS.keys()))
+
+# Placeholder timeout value for manual tests, convenient than 0 for sorting
+MANUAL_TEST_TIMEOUT = 10000
+
+# Timeout used for the `runall` shellcmd (-c option)
+ALL_TESTS_TIMEOUT   = 4 * TIMEOUTS['med']
+
+load_tests_func_by_type_list = [
+   'load_list_of_kernel_self_tests',
+   'load_list_of_shell_cmd_tests',
+   'load_list_of_interactive_tests',
+]
+
+tt_pretty_names = {
+   val: TEST_TYPES_PRETTY[i] for i, val in enumerate(TEST_TYPES)
+}
+
+load_tests_func_by_type = {
+   val: load_tests_func_by_type_list[i] for i, val in enumerate(TEST_TYPES)
+}
+
+tt_indexes = {
+   val : i for i, val in enumerate(TEST_TYPES)
+}
+
+# Global variables
+
+tests_by_type : Dict[str, List[Tuple[str,int]]] = { k: [] for k in TEST_TYPES }
+tests_to_run  : Dict[str, int]                  = { k:  0 for k in TEST_TYPES }
+tests_passed  : Dict[str, int]                  = { k:  0 for k in TEST_TYPES }
+test_runners  : Dict[str, str]                  = { k: "" for k in TEST_TYPES }
+
+def timeout_name(val):
+
+   if val in INV_TIMEOUTS:
+      return INV_TIMEOUTS[val]
+
+   for t in ordered_timeouts:
+
+      if val <= t:
+         return INV_TIMEOUTS[t]
+
+   return "(other)"
+
+def arg_type_test(s):
+
+   if s in TEST_TYPES:
+      return s
+
+   tt = list(filter(lambda x: x.startswith(s), TEST_TYPES))
+
+   if len(tt) == 0:
+      raise argparse.ArgumentTypeError("No such test type: '{}'".format(s))
+
+   if len(tt) > 1:
+      raise argparse.ArgumentTypeError("Ambiguous test type: '{}'".format(s))
+
+   return tt[0]
+
+def arg_type_timeout(s):
+
+   if s in TIMEOUTS:
+      return TIMEOUTS[s]
+
+   if s in INF_STR_TIMEOUTS:
+      return 0
+
+   # OK, at this point 's' must be an integer
+
+   try:
+
+      return int(s)
+
+   except:
+
+      raise argparse.ArgumentTypeError(
+         "Timeout must be an integer or one of: {}"
+            .format(", ".join(list(TIMEOUTS.keys()) + INF_STR_TIMEOUTS))
+      )
+
+def load_all_tests():
+
+   global tests_by_type
+
+   for tt in TEST_TYPES:
+      tests_by_type[tt] = globals()[load_tests_func_by_type[tt]]()
+
+def load_list_of_interactive_tests():
+
+   result = []
+
+   rit = os.path.join(BUILD_DIR, 'st', 'run_interactive_test')
+
+   try:
+
+      output = subprocess.check_output([rit, '-l']).decode("utf-8")
+
+   except subprocess.CalledProcessError as e:
+
+      if e.returncode == Fail.invalid_build_config.value:
+         # That's perfectly fine: this build has not been configured for
+         # running interactive tests. Just return an empty list.
+         return []
+
+      if e.returncode == Fail.invalid_system_config.value:
+         # That's also possible (i.e. ImageMagick is not installed). Return
+         # an empty list as above
+         return []
+
+      # Oops, something weird happened: we cannot ignore the error.
+      raise
+
+   arr = output.split("\n")
+
+   for r in arr:
+
+      r = r.strip()
+
+      if r:
+         result.append([r, TIMEOUTS['medlong']])
+
+   test_runners["interactive"] = "@CMAKE_BINARY_DIR@/st/run_interactive_test"
+   return result
+
+def load_list_of_shell_cmd_tests():
+
+   result = []
+
+   devshell = os.path.join(BUILD_DIR, 'userapps', 'devshell')
+   output = subprocess.check_output([devshell, '-l']).decode("utf-8")
+   arr = output.split("\n")
+
+   for r in arr:
+
+      r = r.rstrip()
+
+      if not r:
+         continue
+
+      name, tt = r.split(' ')
+
+      if not tt.startswith('tt_'):
+         continue
+
+      tt = tt[3:] # Skip the "tt_" prefix
+      result.append([name, TIMEOUTS[tt]])
+
+   test_runners["shellcmd"] = "@CMAKE_BINARY_DIR@/st/single_test_run"
+   return sorted(result, key = lambda x: x[1])
+
+def load_list_of_kernel_self_tests():
+
+   result = []
+   rows = subprocess                             \
+            .check_output(['nm', KERNEL_FILE])   \
+               .decode("utf-8")                  \
+                  .split("\n")
+
+   for row in rows:
+
+      row = row.rstrip()
+
+      if not row:
+         continue
+
+      vaddr, t, name = row.split(' ')      # pylint: disable=unused-variable
+
+      if not name.startswith('selftest_'):
+         continue
+
+      comps = name.split('_')
+      tt = comps[-1]
+
+      if tt not in (list(TIMEOUTS.keys()) + ['manual']):
+         continue
+
+      name = '_'.join(comps[1:])
+
+      if tt == 'manual':
+         tt = MANUAL_TEST_TIMEOUT
+      else:
+         tt = TIMEOUTS[tt]
+
+      result.append([name, tt])
+
+   test_runners["selftest"] = "@CMAKE_BINARY_DIR@/st/single_test_run"
+   return sorted(result, key = lambda x: x[1])
+
+
+def internal_single_test_runner_thread(test_type, test, timeout, show_output):
+
+   raw_print(
+      "[ RUNNING ] {}: '{}' [timeout: {}]".format(test_type, test, timeout)
+   )
+
+   cmdline = [
+      test_runners[test_type],
+      test_type,
+      test,
+      str(timeout),
+      get_qemu_kvm_version(),
+   ]
+
+   start_time = time.time()
+
+   p = subprocess.Popen(
+      cmdline,
+      stdin = subprocess.DEVNULL,
+      stdout = subprocess.PIPE,
+      stderr = subprocess.STDOUT,
+   )
+
+   if show_output:
+     raw_print("")
+
+   bin_output = b''
+
+   while p.poll() is None:
+
+      bintext = p.stdout.read()
+
+      if not bintext:
+         time.sleep(0.1)
+         continue
+
+      if show_output:
+         direct_print(bintext)
+      else:
+         bin_output += bintext
+
+   elapsed = time.time() - start_time
+
+   if p.returncode != 0:
+
+      if not show_output:
+         raw_print("")
+         direct_print(bin_output)
+
+      raw_print(
+         "[ FAILED  ] after {:.2f} seconds with: {}\n"
+            .format(elapsed, get_fail_by_code(p.returncode))
+      )
+      return False
+
+   raw_print("[ PASSED  ] after {:.2f} seconds\n".format(elapsed))
+   return True
+
+def internal_run_test(test_type, test, timeout, show_output = False):
+
+   with ft.ThreadPoolExecutor(max_workers = 1) as executor:
+
+      future = executor.submit(
+         internal_single_test_runner_thread,
+         test_type,
+         test,
+         timeout,
+         show_output
+      )
+
+      return future.result()
+
+def does_test_match_criteria(x, reg, max_timeout, allow_manual):
+
+   name = x[0]
+   timeout = x[1]
+   is_runall = name in ['runall', 'runall_manual']
+   is_manual = timeout == MANUAL_TEST_TIMEOUT
+   matches_filter = re.match(reg, name) and timeout <= max_timeout
+
+   return is_runall or (matches_filter and (not is_manual or allow_manual))
+
+def list_tests(reg, max_timeout, test_type):
+
+   col_names = [
+      ['test name', 30],
+      ['test type', 12],
+      ['timeout', 10],
+   ]
+   raw_stdout_write("\n")
+
+   for x in col_names:
+      raw_stdout_write('+-')
+      raw_stdout_write(''.center(x[1], '-'))
+   raw_stdout_write('+\n')
+
+   for x in col_names:
+      raw_stdout_write('| ')
+      raw_stdout_write(x[0].center(x[1], ' '))
+   raw_stdout_write('|\n')
+
+   for x in col_names:
+      raw_stdout_write('+-')
+      raw_stdout_write(''.center(x[1], '-'))
+   raw_stdout_write('+\n')
+
+   for tt in TEST_TYPES:
+
+      count = 0
+
+      if test_type and tt != test_type:
+         continue
+
+      for x in tests_by_type[tt]:
+         if does_test_match_criteria(x, reg, max_timeout, True):
+
+            tval = x[1]
+
+            if tval != MANUAL_TEST_TIMEOUT:
+               t = "{}".format(tval)
+            else:
+               t = "<manual>"
+
+            raw_stdout_write('| ')
+            raw_stdout_write(x[0].ljust(col_names[0][1]))
+            raw_stdout_write('| ')
+            raw_stdout_write(tt.ljust(col_names[1][1]))
+            raw_stdout_write('| ')
+            raw_stdout_write(t.ljust(col_names[2][1]))
+            raw_stdout_write('|\n')
+            count += 1
+
+      if count > 0:
+         for x in col_names:
+            raw_stdout_write('+-')
+            raw_stdout_write(''.center(x[1], '-'))
+         raw_stdout_write('+\n')
+
+   raw_stdout_write('\n')
+
+def get_sum(per_test_counter):
+   return sum(per_test_counter[k] for k in per_test_counter)
+
+def run_test(test_type, x, show_output):
+
+   global tests_to_run, tests_passed
+
+   if get_sum(tests_to_run) == 0:
+      raw_print("")
+
+   tests_to_run[test_type] += 1
+   if internal_run_test(test_type, x[0], x[1], show_output):
+      tests_passed[test_type] += 1
+
+def run_all_tests(max_timeout, show_output, reg, fail_on_zero, test_type):
+
+   for tt in TEST_TYPES:
+
+      if test_type and tt != test_type:
+         continue
+
+      for x in tests_by_type[tt]:
+         if does_test_match_criteria(x, reg, max_timeout, False):
+            run_test(tt, x, show_output)
+
+   if fail_on_zero:
+      if sum(tests_to_run.values()) == 0:
+
+         found = []
+         for tt in TEST_TYPES:
+            for x in tests_by_type[tt]:
+               if re.match(reg, x[0]):
+                  found.append(x)
+
+         if not found:
+            raw_print("ERROR: No tests matching the '{}' regex.".format(reg))
+         else:
+            raw_print(
+               "ERROR: No tests matching "
+               "the '{}' regex having timeout <= {}"
+                  .format(reg, max_timeout)
+            )
+            raw_print(
+               "Tests matching the regex with timeout > {}:"
+                  .format(max_timeout)
+            )
+            for x in found:
+               if x[1] != MANUAL_TEST_TIMEOUT:
+                  raw_print("  {} [timeout: {}s]".format(x[0].ljust(20), x[1]))
+               else:
+                  raw_print("  {} [manual test]".format(x[0].ljust(20)))
+
+         sys.exit(Fail.no_tests_matching.value)
+
+def dump_test_stats():
+
+   raw_print('-' * 80)
+
+   for tt in TEST_TYPES:
+      if tests_to_run[tt]:
+         raw_print("{} passed: {}/{}"
+                     .format(tt_pretty_names[tt],
+                             tests_passed[tt],
+                             tests_to_run[tt]))
+
+def parse_args():
+
+   parser = argparse.ArgumentParser()
+
+   g = parser.add_mutually_exclusive_group()
+
+   g.add_argument(
+      "-l", "--list-tests",
+      action = "store_true",
+      help = "list all tests matching the criteria (dry-run)"
+   )
+
+   g.add_argument(
+      "-L", "--list-all-tests",
+      action = "store_true",
+      help = "list all tests, no matter their timeout (same as -l -t any)"
+   )
+
+   g.add_argument(
+      "-j", "--list-timeouts",
+      action = "store_true",
+      help = "list the predefined timeout values with labels usable with -t"
+   )
+
+   parser.add_argument(
+      "-c", "--compact-run",
+      action = "store_true",
+      help = "run all the shellcmds in a single VM run (faster)"
+   )
+
+   parser.add_argument(
+      "-o", "--show-output",
+      action = "store_true",
+      help = "show test's output even in case of success"
+   )
+
+   parser.add_argument(
+      "-f", "--filter",
+      type = str,
+      default = ".*",
+      help = "run only tests matching the given regex filter"
+   )
+
+   parser.add_argument(
+      "-t", "--max-timeout",
+      type = arg_type_timeout,
+      default = TIMEOUTS['med'],
+      help = "run only tests having timeout <= MAX_TIMEOUT "
+             "(default: {})".format(TIMEOUTS['med'])
+   )
+
+   parser.add_argument(
+      "-T", "--test_type",
+      type = arg_type_test,
+      help = "run only tests of the given type"
+   )
+
+   try:
+      args = parser.parse_args()
+   except SystemExit:
+      sys.exit(Fail.invalid_args.value)
+
+   return args
+
+def list_timeouts():
+
+   for tname in TIMEOUTS:
+      raw_print("{:8}: {:3} seconds".format(tname, TIMEOUTS[tname]))
+
+   for s in INF_STR_TIMEOUTS:
+      raw_print("{:8}: <no timeout>".format(s))
+
+def main():
+
+   global tests_by_type
+   global tests_to_run
+   set_runner_name("test runner")
+
+   load_all_tests()
+   args = parse_args()
+
+   if args.compact_run:
+      tests_by_type['shellcmd'] = [ ['runall', ALL_TESTS_TIMEOUT] ]
+
+   if args.list_timeouts:
+      list_timeouts()
+      sys.exit(0)
+
+   if args.list_all_tests:
+      args.max_timeout = MANUAL_TEST_TIMEOUT
+      args.list_tests = True
+
+   if args.max_timeout == 0:
+      args.max_timeout = MANUAL_TEST_TIMEOUT
+
+   if args.list_tests:
+      list_tests(args.filter, args.max_timeout, args.test_type)
+      sys.exit(0)
+
+   detect_kvm()
+
+   if is_cmake_opt_enabled(KERNEL_FORCE_TC_ISYSTEM):
+      unrunnable_build_graceful_exit()
+
+   try:
+
+      run_all_tests(args.max_timeout,
+                    args.show_output,
+                    args.filter,
+                    not args.compact_run,
+                    args.test_type)
+
+   except KeyboardInterrupt:
+      msg_print("KeyboardInterrupt")
+      sys.exit(Fail.user_interruption.value)
+
+   dump_test_stats()
+
+   if get_sum(tests_passed) != get_sum(tests_to_run):
+      sys.exit(Fail.some_tests_failed.value)
+
+###############################
+if __name__ == '__main__':
+   main()

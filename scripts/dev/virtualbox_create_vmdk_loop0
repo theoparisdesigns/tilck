@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+rawImg="tilck.img"
+vmdk="tilck.vmdk"
+
+pushd ./build
+
+sudo losetup -D
+sudo losetup /dev/loop0 $rawImg
+sudo chmod o+rw /dev/loop0
+rm -f $vmdk
+VBoxManage internalcommands createrawvmdk -filename $vmdk -rawdisk /dev/loop0
+sudo chown $USER $vmdk
+
+popd
